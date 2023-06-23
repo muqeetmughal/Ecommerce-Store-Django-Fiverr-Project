@@ -6,6 +6,9 @@ import stripe
 from django.conf import settings
 from .models import *
 from .utils import cookie_cart, cart_data, guest_order
+from django.views.generic.base import TemplateView
+from django.http.response import JsonResponse, HttpResponse
+
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
@@ -20,7 +23,6 @@ def store(request):
 
 
 def cart(request):
-
     data = cart_data(request)
     cart_items = data['cart_items']
     order = data['order']
@@ -30,34 +32,59 @@ def cart(request):
     return render(request, 'store/cart.html', context)
 
 
+def create_checkout_session(items, order_id):
+    YOUR_DOMAIN = 'http://127.0.0.1:8000/'
+    line_items = []
+    checkout_session = None
+    for item in items:
+        print(type(item))
+        product = item.product
+        # convert product to dictionary
+        product = product.__dict__
+        line_items.append({
+            'price_data': {
+                'currency': 'usd',
+                'unit_amount': int(product['price'] * 100),
+                'product_data': {
+                    'name': product['name'],
+                    'images': [YOUR_DOMAIN + product['image']],
+                },
+            },
+            'quantity': item.quantity,
+        })
+    try:
+        # we create session without stripe_price_id
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            mode='payment',
+            success_url=YOUR_DOMAIN + '/success',
+            cancel_url=YOUR_DOMAIN + '/cancel',
+            line_items=line_items,
+            metadata={
+                'order_id': order_id
+            }
+        )
+        print(checkout_session)
+    except Exception as e:
+        print("Here",e)
+
+    return checkout_session
+
+
 def checkout(request):
 
-
-
-    if request.method == 'POST':
-        YOUR_DOMAIN = 'http://127.0.0.1:8000'
-        try:
-            checkout_session = stripe.checkout.Session.create(
-                line_items=[
-                    {
-                        # Provide the exact Price ID (for example, pr_1234) of the product you want to sell
-                        'price': '2',
-                        'quantity': 1,
-                    },
-                ],
-                mode='payment',
-                success_url=YOUR_DOMAIN + '/success',
-                cancel_url=YOUR_DOMAIN + '/cancel',
-            )
-            print(checkout_session)
-        except Exception as e:
-            print("Here",e)
-        
-        return HttpResponseRedirect("/")
+    # get the items from session
     data = cart_data(request)
     cart_items = data['cart_items']
     order = data['order']
     items = data['items']
+
+    if request.method == 'POST':
+        if not request.user.is_authenticated:
+            return redirect('login')
+        checkout_session = create_checkout_session(items, order.id)
+        return redirect(checkout_session.url)
+
 
     context = {'items':items, 'order':order,'cart_items': cart_items,}
     return render(request, 'store/checkout.html', context)
@@ -127,3 +154,41 @@ def handling_404(request,exception):
 
 def handling_500(request):
     return render(request, 'store/error_pages/500.html')
+
+class SuccessView(TemplateView):
+    template_name = 'store/success.html'
+
+
+class CancelledView(TemplateView):
+    template_name = 'store/cancelled.html'
+
+
+
+@csrf_exempt
+def stripe_webhook(request):
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    endpoint_secret = settings.STRIPE_ENDPOINT_SECRET
+    payload = request.body
+    sig_header = request.META['HTTP_STRIPE_SIGNATURE']
+    event = None
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, endpoint_secret
+        )
+    except ValueError as e:
+        # Invalid payload
+        return HttpResponse(status=400)
+    except stripe.error.SignatureVerificationError as e:
+        # Invalid signature
+        return HttpResponse(status=400)
+
+    # Handle the checkout.session.completed event
+    if event['type'] == 'checkout.session.completed':
+        print("Payment was successful.")
+        order = Order.objects.get(id=event['data']['object']['metadata']['order_id'])
+        order.complete = True
+        order.transaction_id = event['data']['object']['payment_intent']
+        order.save()
+
+    return HttpResponse(status=200)
